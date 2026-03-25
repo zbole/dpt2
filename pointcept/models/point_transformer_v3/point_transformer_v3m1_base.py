@@ -10,6 +10,7 @@ from addict import Dict
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
@@ -88,9 +89,6 @@ class SerializedAttention(PointModule):
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:
-            # when disable flash attention, we still don't want to use mask
-            # consequently, patch size will auto set to the
-            # min number of patch_size_max and number of points
             self.patch_size_max = patch_size
             self.patch_size = 0
             self.attn_drop = torch.nn.Dropout(attn_drop)
@@ -131,7 +129,6 @@ class SerializedAttention(PointModule):
                 )
                 * self.patch_size
             )
-            # only pad point when num of points larger than patch_size
             mask_pad = bincount > self.patch_size
             bincount_pad = ~mask_pad * bincount + mask_pad * bincount_pad
             _offset = nn.functional.pad(offset, (1, 0))
@@ -184,27 +181,22 @@ class SerializedAttention(PointModule):
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
 
-        # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
         # ===================================================================== #
-        # >>> GCDM 注入区 (Zero-Overhead Integration) >>>
+        # >>> GCDM 注入区 >>>
         # ===================================================================== #
         m = None
         if hasattr(point, 'metric_m') and point.metric_m is not None:
             m = point.metric_m[order]
         # ===================================================================== #
-        # <<< GCDM 注入区 结束 <<<
-        # ===================================================================== #
 
         if not self.enable_flash:
-            # 禁用 FlashAttention 时的纯 PyTorch 分支
             q, k, v = qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
             
             if m is not None:
-                # m_i 维度对齐: (N', K, C) -> (N', K, H, C//H) -> (N', H, K, C//H)
                 m = m.reshape(-1, K, H, C // H).permute(0, 2, 1, 3)
-                q = q * m # 伪黎曼空间度量变换： \tilde{Q} = Q \odot m
+                q = q * m 
 
             if self.upcast_attention:
                 q = q.float()
@@ -223,10 +215,9 @@ class SerializedAttention(PointModule):
             
             if m is not None:
                 m = m.reshape(-1, H, C // H)
-                # 【修改点】：安全解包，乘法操作后重新打包，避免 In-place 报错
-                q, k, v = qkv.unbind(dim=1)  # q, k, v shape: (N, H, C//H)
-                q = q * m                    # Out-of-place 计算伪黎曼度量
-                qkv = torch.stack([q, k, v], dim=1) # 重新堆叠回 (-1, 3, H, C//H)
+                q, k, v = qkv.unbind(dim=1) 
+                q = q * m 
+                qkv = torch.stack([q, k, v], dim=1) 
 
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv.to(torch.bfloat16),
@@ -239,7 +230,6 @@ class SerializedAttention(PointModule):
             
         feat = feat[inverse]
 
-        # ffn
         feat = self.proj(feat)
         feat = self.proj_drop(feat)
         point.feat = feat
@@ -341,61 +331,35 @@ class Block(PointModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
 
-        # ✅ 1. SuperCPE (geo_mlp): 只有浅层 (Stage 0 和 1) 才初始化，节省参数
-        if self.stage_index < 2:
-            self.geo_mlp = nn.Sequential(
-                nn.Linear(4, channels // 4),
+        # =====================================================================
+        # 🚀 极致纯净的度量干预：只保留 DINO 
+        # =====================================================================
+        if self.stage_index >= 2:
+            self.metric_mlp_dino = nn.Sequential(
+                nn.Linear(1024, channels // 4), 
                 nn.GELU(),
                 nn.Linear(channels // 4, channels),
-                nn.Sigmoid() 
+                nn.Tanh()
             )
+            self.dino_beta = nn.Parameter(torch.zeros(1))
         else:
-            self.geo_mlp = None
-
-        self.metric_mlp_geo = nn.Sequential(
-            nn.Linear(4, channels // 4),
-            nn.GELU(),
-            nn.Linear(channels // 4, channels),
-            nn.Sigmoid() 
-        )
-        
-        # ✅ 2. 修改点：现在的 DINO 先验已经对齐了当前 stage 的通道数
-        self.metric_mlp_dino = nn.Sequential(
-            nn.Linear(channels, channels // 4), # 从 6 改为 channels
-            nn.GELU(),
-            nn.Linear(channels // 4, channels),
-            nn.Sigmoid() 
-        )
-        
-        nn.init.zeros_(self.metric_mlp_geo[-2].weight)
-        nn.init.zeros_(self.metric_mlp_geo[-2].bias)
-        nn.init.zeros_(self.metric_mlp_dino[-2].weight)
-        nn.init.zeros_(self.metric_mlp_dino[-2].bias)
+            self.metric_mlp_dino = None
+            self.dino_beta = None
 
     def forward(self, point: Point):
         # 1. CPE 提取局部特征
         shortcut = point.feat
         point = self.cpe(point)
 
-        # 2. Phase 1 & 2: 几何特征激发 与 度量张量生成
-        if hasattr(point, "geo_prior"):
-            if self.stage_index < 2 and self.geo_mlp is not None:
-                geo_attn = self.geo_mlp(point.geo_prior)
-                point.feat = shortcut + point.feat * (1.0 + geo_attn) 
-            else:
-                point.feat = shortcut + point.feat
-
-            # Phase 2: GCDM - 交叉门控度量
-            geo_gate = self.metric_mlp_geo(point.geo_prior) * 2.0 
-            
-            if hasattr(point, "dino_prior"):
-                dino_gate = self.metric_mlp_dino(point.dino_prior)
-                point.metric_m = geo_gate * dino_gate
-            else:
-                point.metric_m = geo_gate
+        # 2. 🚀 GCDM 极简版：只由 DINO 提供跨模态的度量干预
+        if self.stage_index >= 2 and hasattr(point, "dino_prior") and self.metric_mlp_dino is not None:
+            dino_gate = self.metric_mlp_dino(point.dino_prior) 
+            beta = torch.clamp(self.dino_beta, min=-0.1, max=0.1)
+            point.metric_m = 1.0 + (beta * dino_gate)
         else:
-            point.feat = shortcut + point.feat
             point.metric_m = None
+
+        point.feat = shortcut + point.feat
 
         # 3. Attention 模块 (自带残差)
         shortcut = point.feat
@@ -405,10 +369,10 @@ class Block(PointModule):
         point = self.drop_path(self.attn(point))
         point.feat = shortcut + point.feat
 
+        # 4. MLP 模块 (自带残差)
         if not self.pre_norm:
             point = self.norm1(point)
 
-        # 4. MLP 模块 (自带残差)
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm2(point)
@@ -431,14 +395,12 @@ class SerializedPooling(PointModule):
         act_layer=None,
         reduce="max",
         shuffle_orders=True,
-        traceable=True,  # record parent and cluster
+        traceable=True,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-
         assert stride == 2 ** (math.ceil(stride) - 1).bit_length()  # 2, 4, 8
-        # TODO: add support to grid pool (any stride)
         self.stride = stride
         assert reduce in ["sum", "mean", "min", "max"]
         self.reduce = reduce
@@ -471,13 +433,9 @@ class SerializedPooling(PointModule):
             return_inverse=True,
             return_counts=True,
         )
-        # indices of point sorted by cluster, for torch_scatter.segment_csr
         _, indices = torch.sort(cluster)
-        # index pointer for sorted point, for torch_scatter.segment_csr
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
-        # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
-        # generate down code, order, inverse
         code = code[:, head_indices]
         order = torch.argsort(code)
         inverse = torch.zeros_like(order).scatter_(
@@ -494,7 +452,7 @@ class SerializedPooling(PointModule):
             order = order[perm]
             inverse = inverse[perm]
 
-        # collect information
+        # 💥 修正点：彻底清除失效的 geo_prior 逻辑，只保留纯净的 DINO
         point_dict = Dict(
             feat=torch_scatter.segment_csr(
                 self.proj(point.feat)[indices], idx_ptr, reduce=self.reduce
@@ -502,16 +460,9 @@ class SerializedPooling(PointModule):
             coord=torch_scatter.segment_csr(
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
-
-            geo_prior=torch_scatter.segment_csr(
-                point.geo_prior[indices], idx_ptr, reduce="mean"
-            ) if "geo_prior" in point.keys() else None,
-            
-            # ✅ 新增：把 dino_prior 也做 Mean Pooling 传下去
             dino_prior=torch_scatter.segment_csr(
                 point.dino_prior[indices], idx_ptr, reduce="mean"
             ) if "dino_prior" in point.keys() else None,
-
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
             serialized_code=code,
             serialized_order=order,
@@ -520,8 +471,6 @@ class SerializedPooling(PointModule):
             batch=point.batch[head_indices],
         )
 
-        if point_dict.geo_prior is None:
-            del point_dict["geo_prior"]
         if point_dict.dino_prior is None:
             del point_dict["dino_prior"]
 
@@ -533,7 +482,13 @@ class SerializedPooling(PointModule):
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
+
+        # 🚀 补丁：拯救 DINO 均值池化后的模长坍缩！
+        if "dino_prior" in point_dict and point_dict["dino_prior"] is not None:
+            point_dict["dino_prior"] = F.normalize(point_dict["dino_prior"], p=2, dim=-1)
+
         point = Point(point_dict)
+
         if self.norm is not None:
             point = self.norm(point)
         if self.act is not None:
@@ -550,7 +505,7 @@ class SerializedUnpooling(PointModule):
         out_channels,
         norm_layer=None,
         act_layer=None,
-        traceable=False,  # record parent and cluster
+        traceable=False,
     ):
         super().__init__()
         self.proj = PointSequential(nn.Linear(in_channels, out_channels))
@@ -592,7 +547,6 @@ class Embedding(PointModule):
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
-        # TODO: check remove spconv
         self.stem = PointSequential(
             conv=spconv.SubMConv3d(
                 in_channels,
@@ -612,12 +566,55 @@ class Embedding(PointModule):
         point = self.stem(point)
         return point
 
+class TriRegionDinoFusionModule(PointModule):
+    def __init__(self, adapter, stage_dim): 
+        super().__init__()
+        self.adapter = adapter
+        
+        # 你的博弈门控保持不变
+        self.gate_3d = nn.Sequential(nn.Linear(stage_dim, stage_dim // 4), nn.GELU(), nn.Linear(stage_dim // 4, 1))
+        self.gate_2d = nn.Sequential(nn.Linear(stage_dim, stage_dim // 4), nn.GELU(), nn.Linear(stage_dim // 4, 1))
+        nn.init.zeros_(self.gate_3d[-1].weight); nn.init.constant_(self.gate_3d[-1].bias, 0.5)
+        nn.init.zeros_(self.gate_2d[-1].weight); nn.init.constant_(self.gate_2d[-1].bias, 0.0)
+
+        # 🚀 核心升级：为你的“三区域”思想准备一个特征降维压缩器
+        # 输入维度是 stage_dim (纯3D) + stage_dim (纯2D) + stage_dim (融合) = stage_dim * 3
+        self.tri_region_compressor = nn.Sequential(
+            nn.Linear(stage_dim * 3, stage_dim * 2),
+            nn.LayerNorm(stage_dim * 2),
+            nn.GELU(),
+            nn.Linear(stage_dim * 2, stage_dim)
+        )
+
+    def forward(self, p):
+        if hasattr(p, "dino_prior") and p.dino_prior is not None:
+            raw_3d = p.feat.clone() # 🚀 保留纯洁的 3D 区域特征
+            
+            fused_feat = torch.cat([p.feat, p.dino_prior], dim=-1)
+            raw_2d = self.adapter(fused_feat) # 🚀 提纯的 2D 区域特征
+            
+            logit_3d = self.gate_3d(raw_3d)
+            logit_2d = self.gate_2d(raw_3d + raw_2d) 
+            logits = torch.cat([logit_3d, logit_2d], dim=1) 
+            weights = F.softmax(logits, dim=1) 
+            
+            # 🚀 融合区域特征
+            weighted_fused = (weights[:, 0:1] * raw_3d) + (weights[:, 1:2] * raw_2d)
+            
+            # 💥 贯彻你的思想：将三大区域 Concat 成一个超长特征！
+            # [原始3D几何特征, 原始2D视觉特征, 动态博弈融合特征]
+            tri_region_feat = torch.cat([raw_3d, raw_2d, weighted_fused], dim=-1)
+            
+            # 压缩回 stage_dim 送给 PTV3 接下来的层
+            p.feat = self.tri_region_compressor(tri_region_feat)
+            
+        return p
 
 @MODELS.register_module("PT-v3m1")
 class PointTransformerV3(PointModule):
     def __init__(
         self,
-        in_channels=6,
+        in_channels=11,  # 🚀 默认对接 11 维
         order=("z", "z-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -649,6 +646,8 @@ class PointTransformerV3(PointModule):
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
     ):
         super().__init__()
+        self.threshold_offset = nn.Parameter(torch.tensor(0.0))
+
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
@@ -664,30 +663,15 @@ class PointTransformerV3(PointModule):
         assert self.enc_mode or self.num_stages == len(dec_num_head) + 1
         assert self.enc_mode or self.num_stages == len(dec_patch_size) + 1
 
-        # norm layers
         if pdnorm_bn:
-            bn_layer = partial(
-                PDNorm,
-                norm_layer=partial(
-                    nn.BatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine
-                ),
-                conditions=pdnorm_conditions,
-                decouple=pdnorm_decouple,
-                adaptive=pdnorm_adaptive,
-            )
+            bn_layer = partial(PDNorm, norm_layer=partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine), conditions=pdnorm_conditions, decouple=pdnorm_decouple, adaptive=pdnorm_adaptive)
         else:
             bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
         if pdnorm_ln:
-            ln_layer = partial(
-                PDNorm,
-                norm_layer=partial(nn.LayerNorm, elementwise_affine=pdnorm_affine),
-                conditions=pdnorm_conditions,
-                decouple=pdnorm_decouple,
-                adaptive=pdnorm_adaptive,
-            )
+            ln_layer = partial(PDNorm, norm_layer=partial(nn.LayerNorm, elementwise_affine=pdnorm_affine), conditions=pdnorm_conditions, decouple=pdnorm_decouple, adaptive=pdnorm_adaptive)
         else:
             ln_layer = nn.LayerNorm
-        # activation layers
+            
         act_layer = nn.GELU
 
         self.embedding = Embedding(
@@ -697,23 +681,23 @@ class PointTransformerV3(PointModule):
             act_layer=act_layer,
         )
 
-        # ✅ 新增：DINOv3 768D 高维特征适配器 (Dimension Alignment)
-        # 负责将 768 维映射到 PTV3 的初始维度 (enc_channels[0])
-        self.dino_adapter = nn.Sequential(
-            nn.Linear(768, enc_channels[0]),
-            nn.LayerNorm(enc_channels[0]),
-            nn.GELU()
+        self.fusion_stage = 2
+        stage_dim = enc_channels[self.fusion_stage]
+        
+        self.deep_dino_adapter = nn.Sequential(
+            nn.Linear(1024 + stage_dim, stage_dim * 2),
+            nn.LayerNorm(stage_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(stage_dim * 2, stage_dim)
         )
+        
 
         # encoder
-        enc_drop_path = [
-            x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
-        ]
+        enc_drop_path = [x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))]
         self.enc = PointSequential()
         for s in range(self.num_stages):
-            enc_drop_path_ = enc_drop_path[
-                sum(enc_depths[:s]) : sum(enc_depths[: s + 1])
-            ]
+            enc_drop_path_ = enc_drop_path[sum(enc_depths[:s]) : sum(enc_depths[: s + 1])]
             enc = PointSequential()
             if s > 0:
                 enc.add(
@@ -751,6 +735,16 @@ class PointTransformerV3(PointModule):
                     ),
                     name=f"block{i}",
                 )
+            
+            if s == self.fusion_stage:
+                enc.add(
+                    module=TriRegionDinoFusionModule(
+                        adapter=self.deep_dino_adapter, 
+                        stage_dim=stage_dim
+                    ), 
+                    name="dynamic_dino_fusion"
+                )
+                
             if len(enc) != 0:
                 self.enc.add(module=enc, name=f"enc{s}")
 
@@ -806,41 +800,33 @@ class PointTransformerV3(PointModule):
 
     def forward(self, data_dict):
         point = Point(data_dict)
-        # 🚨 维度校验：3 Coord + 3 Color + 4 Geo + 768 DINO = 778
-        assert point.feat.shape[1] == 778, \
-                    f"🚨 致命错误：期望输入特征为 778 维，但实际收到了 {point.feat.shape[1]} 维！请检查 Data Pipeline。"
         
-        # 🛡️ 精准切片提取
-        base_feat = point.feat[:, 0:6].clone()       # [N, 6]   给 SpConv
-        point.geo_prior = point.feat[:, 6:10].clone() # [N, 4]   物理先验
-        
-        # ⚠️ 提取 DINO 时直接转为适合深度学习框架的类型
-        dino_raw_768d = point.feat[:, 10:778].clone().to(torch.bfloat16)
+        # 1. 维度校验 (1035维 = 6D原生 + 4D形状 + 1D高度 + 1024D DINO)
+        if point.feat.shape[1] != 1035:
+             raise ValueError(f"🚨 Dimension Mismatch! Expected 1035, got {point.feat.shape[1]}. ")
 
-        # 核心重组：重置 point.feat，只让基础 6D 进 SpConv
-        point.feat = base_feat 
+        orig_feat = point.feat
 
-        assert point.feat.shape[1] == self.embedding.in_channels, \
-            f"🚨 维度坍缩：重组后的特征为 {point.feat.shape[1]} 维，但 Config 里 in_channels 是 {self.embedding.in_channels}！"
+        # 2. 提取 1D 相对高程
+        raw_z = orig_feat[:, 10:11].clone() 
+        point.raw_z = raw_z 
 
+        # 3. 提取 4D 形状特征
+        geo_4d = orig_feat[:, 6:10].clone() 
+
+        # 4. 提取 1024D DINO
+        point.dino_prior = orig_feat[:, 11:1035].clone() 
+
+        # 5. 💥 架构大一统：构建 11D Base Feature
+        # [X, Y, Z, R, G, B, 形状4维, 相对高度1维]
+        base_feat_6d = orig_feat[:, 0:6].clone() 
+        point.feat = torch.cat([base_feat_6d, geo_4d, raw_z], dim=1)
+
+        # --- 以下进入 PTV3 标准流程 ---
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
-        # 1. 纯净流形提取 (6D -> 32D/64D)
         point = self.embedding(point) 
-        
-        # 2. 旁路对齐：将 768 维语义特征降维到当前 stage 的维度
-        dino_aligned = self.dino_adapter(dino_raw_768d.to(point.feat.dtype))
-        
-        # 3. 及时释放高维巨无霸张量，拯救你的显存
-        del dino_raw_768d 
-        
-        # 4. Feature-level Soft Fusion (特征层融合)
-        point.feat = point.feat + dino_aligned
-        
-        # 5. 将处理好的特征挂载到 dino_prior，供下游 Block 里的 GCDM 调用
-        point.dino_prior = dino_aligned
-
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)

@@ -244,6 +244,55 @@ class Trainer(TrainerBase):
             torch.cuda.empty_cache()
         self.comm_info["model_output_dict"] = output_dict
 
+        # =======================================================
+        # 🚀 进化版探针：监控动态门控与 Block 微调权重
+        # =======================================================
+        if comm.is_main_process():
+            # 1. 拨离 DDP 
+            backbone = self.model.module.backbone if hasattr(self.model, "module") else self.model.backbone
+            
+            # --- 监控双向 Softmax 门控的基准偏置 ---
+            # 使用 try-except 保护，确保探针代码绝对不会引发崩溃
+            try:
+                gate_3d_bias = backbone.enc.enc2.dynamic_dino_fusion.gate_3d[-1].bias.item()
+                gate_2d_bias = backbone.enc.enc2.dynamic_dino_fusion.gate_2d[-1].bias.item()
+            except AttributeError:
+                gate_3d_bias = 0.0
+                gate_2d_bias = 0.0
+
+            # --- 监控所有 Block 内部的 0.3 级微调权重 (取所有层平均) ---
+            geo_alphas = []
+            dino_betas = []
+            for m in backbone.modules():
+                if hasattr(m, "geo_alpha") and m.geo_alpha is not None:
+                    # 记录被 clamp 后的实际生效值
+                    geo_alphas.append(torch.clamp(m.geo_alpha, -0.3, 0.3).item())
+                if hasattr(m, "dino_beta") and m.dino_beta is not None:
+                    dino_betas.append(torch.clamp(m.dino_beta, -0.1, 0.1).item())
+            
+            avg_geo_alpha = sum(geo_alphas) / len(geo_alphas) if geo_alphas else 0
+            avg_dino_beta = sum(dino_betas) / len(dino_betas) if dino_betas else 0
+
+            # 2. 计算全局步数
+            current_step = self.epoch * len(self.train_loader) + self.comm_info["iter"]
+            
+            # 3. 推送到 WandB
+            import wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "train/gate_3d_bias": gate_3d_bias,
+                    "train/gate_2d_bias": gate_2d_bias,
+                    "train/block_geo_alpha_avg": avg_geo_alpha,
+                    "train/block_dino_beta_avg": avg_dino_beta
+                }, step=current_step)
+            
+            # 4. 推送到 Tensorboard (Storage)
+            if self.writer is not None:
+                self.writer.add_scalar("train/gate_3d_bias", gate_3d_bias, current_step)
+                self.writer.add_scalar("train/gate_2d_bias", gate_2d_bias, current_step)
+                self.writer.add_scalar("train/block_dino_beta_avg", avg_dino_beta, current_step)
+        # =======================================================
+
     def after_epoch(self):
         for h in self.hooks:
             h.after_epoch()

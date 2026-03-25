@@ -116,7 +116,7 @@ class ClsEvaluator(HookBase):
 
 @HOOKS.register_module()
 class SemSegEvaluator(HookBase):
-    def __init__(self, write_cls_iou=False):
+    def __init__(self, write_cls_iou=True):
         self.write_cls_iou = write_cls_iou
 
     def before_train(self):
