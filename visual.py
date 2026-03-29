@@ -5,9 +5,9 @@ from plyfile import PlyData, PlyElement
 import time
 from collections import defaultdict
 
-RESULTS_DIR = "./exp/sensaturban/PTV3_1035D_z_DINO1024_DynGCDM_v4/result"
+RESULTS_DIR = "./exp/sensaturban/PTV3_1035D_z_DINO1024_DynGCDM_v10/result"
 DATA_DIR = "../datasets/sensaturban/processed_1035D_with_relativeZ"
-OUTPUT_DIR = "./visualized_results"
+OUTPUT_DIR = "../datasets/sensaturban/result_PTV3"
 
 def save_multi_label_ply(coords, rgbs, gts, preds, save_path):
     """

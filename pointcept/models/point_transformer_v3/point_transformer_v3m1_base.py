@@ -800,27 +800,23 @@ class PointTransformerV3(PointModule):
 
     def forward(self, data_dict):
         point = Point(data_dict)
-        
-        # 1. 维度校验 (1035维 = 6D原生 + 4D形状 + 1D高度 + 1024D DINO)
-        if point.feat.shape[1] != 1035:
-             raise ValueError(f"🚨 Dimension Mismatch! Expected 1035, got {point.feat.shape[1]}. ")
 
         orig_feat = point.feat
 
-        # 2. 提取 1D 相对高程
+        # 2. 提取 1D 宏观相对高程 (保留！这是上帝视角的全局底盘信息)
         raw_z = orig_feat[:, 10:11].clone() 
         point.raw_z = raw_z 
 
-        # 3. 提取 4D 形状特征
-        geo_4d = orig_feat[:, 6:10].clone() 
+        # 🔪 3. 彻底丢弃 4D 局部形状与密度特征 (索引 6:10)
+        # 我们在这里故意忽略 orig_feat[:, 6:10]，防止几何偏见与模态挤压！
 
-        # 4. 提取 1024D DINO
+        # 4. 提取 1024D DINO深层语义先验 (保留！深层 GCDM 模块的灵魂)
         point.dino_prior = orig_feat[:, 11:1035].clone() 
 
-        # 5. 💥 架构大一统：构建 11D Base Feature
-        # [X, Y, Z, R, G, B, 形状4维, 相对高度1维]
+        # 5. 💥 架构大一统：构建最纯粹的 7D 终极 Base Feature
+        # 仅拼接 [X, Y, Z, R, G, B] (6D) 和 [相对高度] (1D)
         base_feat_6d = orig_feat[:, 0:6].clone() 
-        point.feat = torch.cat([base_feat_6d, geo_4d, raw_z], dim=1)
+        point.feat = torch.cat([base_feat_6d, raw_z], dim=1)
 
         # --- 以下进入 PTV3 标准流程 ---
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
