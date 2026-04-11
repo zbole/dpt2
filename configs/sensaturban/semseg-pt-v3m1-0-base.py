@@ -2,9 +2,9 @@ weight = None
 resume = False
 evaluate = True
 test_only = False
-seed = 15897930
-save_path = 'exp/sensaturban/DSGG-PT_Final'
-num_worker = 2
+seed = 2026
+save_path = 'exp/sensaturban/SensatUrban_DSGG-PT_FinalEXP'
+num_worker = 16
 batch_size = 8
 gradient_accumulation_steps = 1
 batch_size_val = None
@@ -92,7 +92,7 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0)
 dataset_type = 'DefaultDataset'
-data_root = '/datasets/sensaturban/processed_1035D_with_relativeZ/'
+data_root = '/datasets/sensaturban/processed_1025D_SP-PT/'
 data = dict(
     num_classes=13,
     ignore_index=255,
@@ -104,7 +104,7 @@ data = dict(
     train=dict(
         type='DefaultDataset',
         split='train',
-        data_root='/datasets/sensaturban/processed_1035D_with_relativeZ/',
+        data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
             dict(
@@ -150,11 +150,11 @@ data = dict(
                 feat_keys=('coord', 'color', 'extra_feat'))
         ],
         test_mode=False,
-        loop=1),
+        loop=5),
     val=dict(
         type='DefaultDataset',
         split='test',
-        data_root='/datasets/sensaturban/processed_1035D_with_relativeZ/',
+        data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
             dict(type='Copy', keys_dict=dict(segment='origin_segment')),
@@ -179,7 +179,7 @@ data = dict(
     test=dict(
         type='DefaultDataset',
         split='test',
-        data_root='/datasets/sensaturban/processed_1035D_with_relativeZ/',
+        data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
             dict(type='NormalizeColor')
@@ -202,9 +202,32 @@ data = dict(
                     keys=('coord', 'grid_coord', 'index'), 
                     feat_keys=('coord', 'color', 'extra_feat'))
             ],
-            aug_transform=[
-                [dict(type='RandomRotateTargetAngle', angle=[0], axis='z', center=[0, 0, 0], p=1)] # 🚀 关键：关闭 TTA
-            ]
+            aug_transform = [
+            # Angle 1: 0度 (Baseline)
+            [{
+                'type': 'RandomRotateTargetAngle',
+                'angle': [0],
+                'axis': 'z',
+                'center': [0, 0, 0],
+                'p': 1
+            }],
+            # Angle 2: 120度 (2/3 Pi)
+            [{
+                'type': 'RandomRotateTargetAngle',
+                'angle': [np.pi * 2 / 3], 
+                'axis': 'z',
+                'center': [0, 0, 0],
+                'p': 1
+            }],
+            # Angle 3: 240度 (4/3 Pi)
+            [{
+                'type': 'RandomRotateTargetAngle',
+                'angle': [np.pi * 4 / 3],
+                'axis': 'z',
+                'center': [0, 0, 0],
+                'p': 1
+            }]
+        ]
         )
     ),
 )

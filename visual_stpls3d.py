@@ -29,10 +29,10 @@ def save_multi_label_ply(coords, rgbs, gts, preds, save_path):
     vertex['green'] = rgbs[:, 1].astype(np.uint8)
     vertex['blue'] = rgbs[:, 2].astype(np.uint8)
     
-    # 🚀 修复：STPLS3D v3 映射后的有效标签是 0~18。
-    # 大于 18 或者小于 0 的，统一设为 255 (Ignore)
-    vertex['gt_class'] = np.where((gts >= 0) & (gts <= 18), gts, 255).astype(np.uint8)
-    vertex['pred_class'] = np.where((preds >= 0) & (preds <= 18), preds, 255).astype(np.uint8)
+    # 🚀 修复1：STPLS3D v3 对齐后的有效标签是 0~18。
+    # 大于 18 的异常值，统一设为 255 (Ignore)
+    vertex['gt_class'] = np.where(gts <= 18, gts, 255).astype(np.uint8)
+    vertex['pred_class'] = np.where(preds <= 18, preds, 255).astype(np.uint8)
 
     el = PlyElement.describe(vertex, 'vertex')
     PlyData([el], text=False).write(save_path)
@@ -109,9 +109,16 @@ def main():
         base_gts = np.concatenate(all_gts)
         base_rgbs = np.vstack(all_rgbs)
         
-        # 保存为极其精简的多标签 PLY
+        # 🚀 修复2：强制对齐标签体系到官方的 0~18 
+        # 1. 处理 GT：将 255(被当做ignore的Ground) 强行映射回 0。原本的 0~17 整体 +1
+        base_gts_aligned = np.where(base_gts == 255, 0, base_gts + 1).astype(np.uint8)
+        
+        # 2. 处理 Preds：模型输出的是 0~17，整体 +1 变成 1~18 对齐真实语义
+        base_preds_aligned = (base_preds + 1).astype(np.uint8)
+        
+        # 保存为极其精简的多标签 PLY (注意这里传入的是 aligned 之后的标签)
         output_ply_path = os.path.join(OUTPUT_DIR, f"{big_block}_MultiLabel.ply")
-        save_multi_label_ply(base_coords, base_rgbs, base_gts, base_preds, output_ply_path)
+        save_multi_label_ply(base_coords, base_rgbs, base_gts_aligned, base_preds_aligned, output_ply_path)
         print(f"✅ 已保存至: {output_ply_path} (点数: {base_coords.shape[0]:,})")
 
     print(f"\n🎉 耗时: {(time.time() - start_time)/60:.2f} 分钟")

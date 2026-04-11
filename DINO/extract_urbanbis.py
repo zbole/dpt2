@@ -1,59 +1,32 @@
 import os
-import time
 import torch
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 from torchvision.transforms import v2
 from transformers import AutoModel
 from pathlib import Path
-from tqdm import tqdm
 from scipy.spatial import cKDTree
-from plyfile import PlyData
 
 # ========================================================
-# 1. 路径与全局配置
+# 1. 路径与全局配置 (针对 UrbanBIS 修改)
 # ========================================================
-dataset_root = Path("/lus/lfs1aip2/projects/b6ae/datasets/sensaturban").resolve()
-RAW_DATA_ROOT = dataset_root / "raw"
-# 🚀 你的全新 1024D 极净数据集目录
-OUT_DATA_ROOT = dataset_root / "processed_1024D_Full" 
+# 🚀 替换为 UrbanBIS 的真实路径
+dataset_root = Path("/lus/lfs1aip2/projects/b6ae/datasets/UrbanBIS").resolve()
+# 针对你截图中的目录结构
+RAW_DATA_ROOT = dataset_root / "raw" / "Lihu"
+# 最终保存的目录
+OUT_DATA_ROOT = dataset_root / "processed_1025D_Pure" 
 
-# 模型权重路径 (与脚本同目录的 weights 文件夹)
 WEIGHT_PATH = Path("./weights").resolve()
 DEVICE = "cuda"
 
 # ========================================================
-# 2. 纯 Numpy 几何先验提取
-# ========================================================
-def extract_geometric_features_vectorized(points, k=16):
-    """提取基础的 PCA 几何特征 (用于 PTV3 3D 主干)"""
-    tree = cKDTree(points)
-    _, idx = tree.query(points, k=k, workers=-1)
-    neighbors = points[idx] 
-    
-    centered = neighbors - np.mean(neighbors, axis=1, keepdims=True)
-    cov = np.matmul(centered.transpose(0, 2, 1), centered) / (k - 1)
-    
-    evals = np.linalg.eigvalsh(cov)
-    evals = np.flip(evals, axis=1) 
-    evals = np.maximum(evals, 1e-8)
-    
-    sum_vals = np.sum(evals, axis=1, keepdims=True) + 1e-8
-    l1, l2, l3 = evals[:, 0:1], evals[:, 1:2], evals[:, 2:3]
-    
-    linearity = (l1 - l2) / sum_vals
-    planarity = (l2 - l3) / sum_vals
-    scattering = l3 / sum_vals
-    
-    return np.concatenate([linearity, planarity, scattering], axis=1).astype(np.float32)
-
-# ========================================================
-# 3. DINOv3 提取器 (彻底修复 Patch Size 与动态张量截取)
+# 2. DINOv3 提取器 (必须包含这个类！)
 # ========================================================
 class DINOv3FeatureExtractor:
     def __init__(self, model_path_or_name: str, device: str = "cuda"):
         self.device = torch.device(device)
-        
         print(f"🚀 Loading ViT model from: {model_path_or_name}")
         self.model = AutoModel.from_pretrained(
             model_path_or_name,
@@ -62,7 +35,6 @@ class DINOv3FeatureExtractor:
         )
         self.model.eval()
 
-        # 🚀 动态读取模型真实的 patch_size，彻底杜绝硬编码冲突！
         self.patch_size = self.model.config.patch_size 
         print(f"✅ Detected model patch_size: {self.patch_size}")
 
@@ -115,12 +87,10 @@ class DINOv3FeatureExtractor:
         with torch.autocast('cuda', dtype=torch.bfloat16):
             outputs = self.model(pixel_values=input_tensor, interpolate_pos_encoding=True)
 
-        # 🚀 动态截取正确的 Patch tokens (无视前面有几个特殊 Token)
         num_patches = grid_H * grid_W
         patch_tokens = outputs.last_hidden_state[:, -num_patches:, :]
         Hidden_Dim = patch_tokens.shape[-1]
 
-        # 现在 reshape 绝对安全，不会再报错 size invalid
         feature_map_2d = patch_tokens.reshape(1, grid_H, grid_W, Hidden_Dim).permute(0, 3, 1, 2)
         feature_map_upsampled = F.interpolate(feature_map_2d.float(), size=(padded_H, padded_W), mode='bilinear', align_corners=False)
         feature_map_cropped = feature_map_upsampled[0, :, :H, :W]
@@ -132,64 +102,71 @@ class DINOv3FeatureExtractor:
         return point_level_dino_features
 
 # ========================================================
-# 4. 全量端到端处理流水线 (从 Raw 到 1024D Chunk)
+# 3. UrbanBIS 专属场景处理函数
 # ========================================================
-def process_scene(scene_path, extractor):
-    scene_path = Path(scene_path)
-    scene_name = scene_path.stem.lower()
+def process_urbanbis_scene(txt_path, extractor):
+    txt_path = Path(txt_path)
+    scene_name = txt_path.stem
+    # 自动识别当前是在 train 还是 test 文件夹下
+    split = txt_path.parent.name 
     
-    # 划分数据集 (Birmingham & Cambridge)
-    if "train" in str(scene_path):
-        VAL_LIST = ["birmingham_block_1", "birmingham_block_6", "cambridge_block_12", "cambridge_block_6"]
-        split = "val" if any(b in scene_name for b in VAL_LIST) else "train"
-    else:
-        split = "test"
-        
     save_dir = OUT_DATA_ROOT / split
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n📂 Loading RAW file: {scene_name} ...")
+    print(f"\n📂 Loading TXT file: [{split}] {scene_name} ...")
+    
     try:
-        with open(str(scene_path), 'rb') as f:
-            v = PlyData.read(f)['vertex']
-        pts = np.stack([v['x'], v['y'], v['z']], axis=1).astype(np.float32)
-        rgb = np.stack([v['red'], v['green'], v['blue']], axis=1).astype(np.uint8)
-        sem = v['class'].astype(np.int16) if 'class' in v else np.full(len(pts), 255)
-    except Exception as e: 
+        # 使用 pandas 极速读取 txt (跳过任何可能的脏数据行)
+        df = pd.read_csv(str(txt_path), sep='\s+', header=None, 
+                         names=['x', 'y', 'z', 'r', 'g', 'b', 'sem', 'ins1', 'ins2'],
+                         on_bad_lines='skip')
+        
+        pts = df[['x', 'y', 'z']].values.astype(np.float32)
+        rgb = df[['r', 'g', 'b']].values.astype(np.uint8)
+        sem = df['sem'].values.astype(np.int16)
+        
+        # 🚀 极其关键：将 UrbanBIS 特有的 -100 (无标记) 转换为 255 (PyTorch 忽略类)
+        sem[sem == -100] = 255
+        
+        # 🚀 检查：打印真实的标签分布，确保 0-6 的有效类都在，且无标记被正确转为 255
+        unique_labels = np.unique(sem)
+        print(f"📊 [Debug] 映射后真实存在的标签包含: {unique_labels}")
+        
+    except Exception as e:
         print(f"❌ Load Error: {e}")
         return
 
-    # 1. 基础分辨率降采样 (0.1m, 用于保留建筑细节和 3D 主干输入)
+    # 1. 基础分辨率降采样 (0.1m)
     pts -= pts.min(axis=0)
     grid_coord = np.floor(pts / 0.1).astype(int)
-    _, idx, counts = np.unique(grid_coord, axis=0, return_index=True, return_counts=True)
+    _, idx = np.unique(grid_coord, axis=0, return_index=True)
     pts, rgb, sem = pts[idx], rgb[idx], sem[idx]
     
-    # 2. 计算 5D 几何先验特征 (在全局尺度计算，避免切块边缘截断效应)
-    print("📐 Computing global 5D Geometric Features...")
-    density = (counts.astype(np.float32).reshape(-1, 1) / counts.max()).astype(np.float32)
-    eigen = extract_geometric_features_vectorized(pts)
+    # 2. 计算纯净的 1D 相对高程先验
+    print("📏 Computing robust Global Relative Z...")
+    z_floor = np.percentile(pts[:, 2], 0.1)
+    global_rel_z = (pts[:, 2:3] - z_floor).astype(np.float32)
     
-    # 🚀 补充：提取 Z 坐标作为全局高度先验 (Global_Rel_Z)
-    global_rel_z = pts[:, 2:3].astype(np.float32) 
+    # 🚀 修复 1：高程归一化！防止几百米的绝对高程梯度爆炸
+    global_rel_z = np.clip(global_rel_z / 100.0, 0.0, 1.0)
     
-    # 拼接为 5D: [Linearity, Planarity, Scattering, Density, Global_Rel_Z]
-    geo_prior = np.concatenate([eigen, density, global_rel_z], axis=1).astype(np.float32)
-    
-    # 3. 空间切块并提取 DINO (50m x 50m)
+    # 3. 空间切块并提取 DINO 
     x_max, y_max = pts.max(axis=0)[:2]
     chunk_count = 0
     
-    print("✂️ Chunking & Extracting DINOv3 1024D...")
-    for x in np.arange(0, x_max, 25):
-        for y in np.arange(0, y_max, 25):
+    # 🚀 修复 2：动态步长。Train 重叠增强 (25m)，Test/Val 无缝拼接 (50m) 防止泄露和重复计算
+    stride = 25 if split == "train" else 50
+    
+    print(f"✂️ Chunking (Stride: {stride}m) & Extracting DINOv3 1024D...")
+    for x in np.arange(0, x_max, stride):
+        for y in np.arange(0, y_max, stride):
             mask = (pts[:, 0] >= x) & (pts[:, 0] < x + 50) & (pts[:, 1] >= y) & (pts[:, 1] < y + 50)
             if np.sum(mask) < 1024: continue 
             
             chunk_folder = save_dir / f"{scene_name}_{chunk_count}"
             
             # 断点续传保护
-            if (chunk_folder / "dino_1024d.npy").exists():
+            if (chunk_folder / "extra_feat.npy").exists():
                 chunk_count += 1
                 continue
                 
@@ -197,42 +174,52 @@ def process_scene(scene_path, extractor):
             
             pts_chunk = pts[mask]
             rgb_chunk = rgb[mask]
-            geo_chunk = geo_prior[mask]
             sem_chunk = sem[mask]
+            rel_z_chunk = global_rel_z[mask]
             
-            # 🚀 纯 Numpy 模拟 Open3D voxel_down_sample(0.5m) 用于 DINO 提特征
+            # 模拟 voxel_down_sample(0.5m) 用于 DINO 提特征
             grid_coord_05 = np.floor(pts_chunk / 0.5).astype(int)
             _, idx_05 = np.unique(grid_coord_05, axis=0, return_index=True)
             down_coords_np = pts_chunk[idx_05]
-            down_colors_np = rgb_chunk[idx_05].astype(np.float32) / 255.0 # DINO 需要 0-1 范围
+            down_colors_np = rgb_chunk[idx_05].astype(np.float32) / 255.0 
             
             down_coords = torch.tensor(down_coords_np, dtype=torch.float32)
             down_colors = torch.tensor(down_colors_np, dtype=torch.float32)
             
-            # 🚀 极速提取 1024D DINO 先验
+            # 提取 DINO 先验
             down_features = extractor.extract_and_lift_features(down_coords, down_colors, resolution=0.5)
             
-            # 🚀 映射回 0.1m 分辨率的点云
+            # 映射回 0.1m 分辨率
             kdtree = cKDTree(down_coords_np)
             _, indices = kdtree.query(pts_chunk, k=1, workers=-1)
             full_res_dino = down_features[indices].numpy()
             
-            # 保存到全新目录！极其干净的数据结构
+            # 🚀 组合终极 1025D Extra Feature [Rel_Z, DINO]
+            extra_feat = np.concatenate([rel_z_chunk, full_res_dino], axis=1).astype(np.float32)
+            
+            # 保存数据
             np.save(chunk_folder / "coord.npy", pts_chunk)
             np.save(chunk_folder / "color.npy", rgb_chunk)
             np.save(chunk_folder / "segment.npy", sem_chunk)
-            np.save(chunk_folder / "extra_feat.npy", extra_feat) # 🚀 替代了原来的 geo 和 dino 散件
+            np.save(chunk_folder / "extra_feat.npy", extra_feat)
             
             chunk_count += 1
 
     print(f"✅ {scene_name} processed: {chunk_count} chunks generated.")
 
+# ========================================================
+# 4. 主程序入口
+# ========================================================
 if __name__ == "__main__":
-    extractor = DINOv3FeatureExtractor(model_path_or_name=str(WEIGHT_PATH))
-    ply_files = sorted(list(RAW_DATA_ROOT.glob("**/*.ply")))
+    # 请确保你的环境里安装了 pandas: pip install pandas
     
-    print(f"\n🚀 Found {len(ply_files)} RAW PLY files. Starting End-to-End Pipeline...")
-    for f in ply_files:
-        process_scene(f, extractor)
+    extractor = DINOv3FeatureExtractor(model_path_or_name=str(WEIGHT_PATH))
+    
+    # 查找所有 .txt 文件
+    txt_files = sorted(list(RAW_DATA_ROOT.glob("**/*.txt")))
+    
+    print(f"\n🚀 Found {len(txt_files)} RAW TXT files in UrbanBIS. Starting Fast Pipeline...")
+    for f in txt_files:
+        process_urbanbis_scene(f, extractor)
         
     print(f"\n🎉 All done! New compact dataset saved to: {OUT_DATA_ROOT}")

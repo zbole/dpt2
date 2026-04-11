@@ -3,8 +3,8 @@ resume = False
 evaluate = True
 test_only = False
 seed = 2026
-num_worker = 24
-batch_size = 8
+num_worker = 16
+batch_size = 6
 gradient_accumulation_steps = 1
 batch_size_val = None
 batch_size_test = None
@@ -216,7 +216,6 @@ data = dict(
                 [dict(type='RandomScale', scale=[0.95, 0.95])],
                 [dict(type='RandomScale', scale=[1.05, 1.05])],
                 
-                # 6. Flip: 轴向镜像 (提升道路和建筑边界的鲁棒性)
                 [dict(type='RandomFlip', p=1.0)], 
             ]
         )

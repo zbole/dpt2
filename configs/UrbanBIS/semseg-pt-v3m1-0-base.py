@@ -1,15 +1,16 @@
-weight = None
+weight = 'exp/UrbanBIS/UrbanBIS_DSGG-PT_Exp/model/model_best.pth'
 resume = False
 evaluate = True
 test_only = False
-seed = 2026
-num_worker = 24
-batch_size = 8
+seed = 20262026
+save_path = 'exp/UrbanBIS/UrbanBIS_DSGG-PT_Exp'
+num_worker = 16
+batch_size = 16
 gradient_accumulation_steps = 1
 batch_size_val = None
 batch_size_test = None
-epoch = 100
-eval_epoch = 100
+epoch = 150
+eval_epoch = 150
 clip_grad = 1.0
 sync_bn = False
 enable_amp = True
@@ -35,7 +36,7 @@ train = dict(type='DefaultTrainer')
 test = dict(type='SemSegTester', verbose=True)
 model = dict(
     type='DefaultSegmentorV2',
-    num_classes=18,
+    num_classes=7,
     backbone_out_channels=64,
     backbone=dict(
         type='PT-v3m1',
@@ -67,13 +68,13 @@ model = dict(
         pdnorm_decouple=True,
         pdnorm_adaptive=False,
         pdnorm_affine=True,
-        pdnorm_conditions=('ScanNet', 'S3DIS', 'Structured3D', 'STPLS3D')), 
+        pdnorm_conditions=('ScanNet', 'S3DIS', 'Structured3D', 'UrbanBIS')), # 🚀 修改点 2：添加 UrbanBIS 条件
     criteria=[
         dict(
             type='CrossEntropyLoss',
             loss_weight=1.0,
             ignore_index=255,
-            weight=None 
+            weight=None
         ),
         dict(
             type='LovaszLoss',
@@ -90,15 +91,12 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0)
 dataset_type = 'DefaultDataset'
-data_root = '/datasets/STPLS3D/WMSC_Hybrid_Dataset/' 
+data_root = '/datasets/UrbanBIS/processed_1025D_Pure/'
 data = dict(
-    num_classes=18,
+    num_classes=7, # 🚀 修改点 4：类别数改为 7
     ignore_index=255,
-    names = [
-    'Building', 'LowVegetation', 'MediumVegetation', 'HighVegetation', 
-    'Vehicle', 'Truck', 'Aircraft', 'MilitaryVehicle', 'Bike', 
-    'Motorcycle', 'LightPole', 'StreetSign', 'Clutter', 'Fence', 
-    'Road', 'Window', 'Dirt', 'Grass'
+    names=[ # 🚀 修改点 5：更新类别名称列表
+        'Terrain', 'Vegetation', 'Water', 'Bridge', 'Vehicle', 'Boat', 'Building'
     ],
     train=dict(
         type='DefaultDataset',
@@ -149,7 +147,7 @@ data = dict(
                 feat_keys=('coord', 'color', 'extra_feat'))
         ],
         test_mode=False,
-        loop=1),
+        loop=5),
     val=dict(
         type='DefaultDataset',
         split='test',
@@ -177,7 +175,7 @@ data = dict(
     
     test=dict(
         type='DefaultDataset',
-        split='test', # 🎯 修正：将 val 恢复为 test
+        split='test',
         data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
@@ -201,23 +199,7 @@ data = dict(
                     feat_keys=('coord', 'color', 'extra_feat'))
             ],
             aug_transform=[
-                # 1. Base: 原始视角 (0°)
-                [dict(type='RandomRotateTargetAngle', angle=[0], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 2. Rotation: Z轴旋转 90° (Pointcept 里 angle 是乘了 pi 的，1/2 代表 90°)
-                [dict(type='RandomRotateTargetAngle', angle=[1/2], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 3. Rotation: Z轴旋转 180°
-                [dict(type='RandomRotateTargetAngle', angle=[1], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 4. Rotation: Z轴旋转 270°
-                [dict(type='RandomRotateTargetAngle', angle=[3/2], axis='z', center=[0, 0, 0], p=1)],
-
-                [dict(type='RandomScale', scale=[0.95, 0.95])],
-                [dict(type='RandomScale', scale=[1.05, 1.05])],
-                
-                # 6. Flip: 轴向镜像 (提升道路和建筑边界的鲁棒性)
-                [dict(type='RandomFlip', p=1.0)], 
+                [dict(type='RandomRotateTargetAngle', angle=[0], axis='z', center=[0, 0, 0], p=1)]
             ]
         )
     ),

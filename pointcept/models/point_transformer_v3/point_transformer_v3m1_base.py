@@ -354,7 +354,7 @@ class Block(PointModule):
         # 2. 🚀 GCDM 极简版：只由 DINO 提供跨模态的度量干预
         if self.stage_index >= 2 and hasattr(point, "dino_prior") and self.metric_mlp_dino is not None:
             dino_gate = self.metric_mlp_dino(point.dino_prior) 
-            beta = torch.clamp(self.dino_beta, min=-0.1, max=0.1)
+            beta = torch.clamp(self.dino_beta, min=-0.3, max=0.3)
             point.metric_m = 1.0 + (beta * dino_gate)
         else:
             point.metric_m = None
@@ -452,7 +452,6 @@ class SerializedPooling(PointModule):
             order = order[perm]
             inverse = inverse[perm]
 
-        # 💥 修正点：彻底清除失效的 geo_prior 逻辑，只保留纯净的 DINO
         point_dict = Dict(
             feat=torch_scatter.segment_csr(
                 self.proj(point.feat)[indices], idx_ptr, reduce=self.reduce
@@ -614,7 +613,7 @@ class TriRegionDinoFusionModule(PointModule):
 class PointTransformerV3(PointModule):
     def __init__(
         self,
-        in_channels=11,  # 🚀 默认对接 11 维
+        in_channels=7,
         order=("z", "z-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -803,19 +802,22 @@ class PointTransformerV3(PointModule):
 
         orig_feat = point.feat
 
-        # 2. 提取 1D 宏观相对高程 (保留！这是上帝视角的全局底盘信息)
-        raw_z = orig_feat[:, 10:11].clone() 
+        # =====================================================================
+        # 🚀 动态特征解耦：彻底告别硬编码！无论输入是 1035D 还是 1025D 都能完美兼容
+        # =====================================================================
+        
+        # 1. 提取最后 1024 维作为 DINO 深层语义先验 (深层 GCDM 模块的灵魂)
+        point.dino_prior = orig_feat[:, -1024:].clone() 
+
+        # 2. 提取倒数第 1025 维作为 1D 宏观相对高程 (上帝视角的全局底盘信息)
+        raw_z = orig_feat[:, -1025:-1024].clone() 
         point.raw_z = raw_z 
 
-        # 🔪 3. 彻底丢弃 4D 局部形状与密度特征 (索引 6:10)
-        # 我们在这里故意忽略 orig_feat[:, 6:10]，防止几何偏见与模态挤压！
-
-        # 4. 提取 1024D DINO深层语义先验 (保留！深层 GCDM 模块的灵魂)
-        point.dino_prior = orig_feat[:, 11:1035].clone() 
-
-        # 5. 💥 架构大一统：构建最纯粹的 7D 终极 Base Feature
-        # 仅拼接 [X, Y, Z, R, G, B] (6D) 和 [相对高度] (1D)
+        # 3. 提取最前方的 6 维作为基础几何与颜色 (XYZ + RGB)
+        # 注意：中间的任何冗余特征（如局部形状、密度等）将在这里被物理级自动过滤，实现真正的 Pure！
         base_feat_6d = orig_feat[:, 0:6].clone() 
+
+        # 4. 💥 架构大一统：构建最纯粹的 7D 终极 Base Feature
         point.feat = torch.cat([base_feat_6d, raw_z], dim=1)
 
         # --- 以下进入 PTV3 标准流程 ---
