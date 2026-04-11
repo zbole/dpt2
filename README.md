@@ -1,5 +1,9 @@
-This is based on Pointcept repo, so you can reproduce this by reading readme in Pointcept repo!
+### 🚀 Reproduction & Setup
+This project is built upon the [Pointcept](https://github.com/Pointcept/Pointcept) codebase. For environment setup and general reproduction steps, please refer to the official Pointcept README.
 
-for initialization, I strongly recommend you to look at /DINO and fetch 2D featrues first.
+### ⚙️ Initialization (Important)
+Prior to training, it is highly recommended to extract the 2D features. Please navigate to the `/DINO` directory and follow the instructions there to fetch them first.
 
-Then there is nothing special to declare.
+### 📦 Pre-trained Models
+The trained checkpoints and results are publicly available on Hugging Face:
+- [Download Weights for DPT](https://huggingface.co/datasets/zhangbole/weights-for-DPT)
